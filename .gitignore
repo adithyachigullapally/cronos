@@ -1,0 +1,10 @@
+# build output and IDE state
+build/
+out/
+.vs/
+.qtcreator/
+*.exe
+*.obj
+
+# microphone recordings used for tuning (large, and they are room audio)
+*.f32

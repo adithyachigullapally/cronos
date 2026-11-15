@@ -4,7 +4,33 @@
 A Windows desktop application that uses the laptop's built-in microphone to detect and classify physical taps on the device chassis (e.g., lid, palm rest, deck) and maps recognized tap patterns to configurable user actions (shortcuts, macros, media controls, etc.).
 
 ## Status
-Early implementation stage.
+Working MVP (Nov 2026): capture, detection, single/double/triple tap patterns, a left and a right side with
+their own actions, settings, tray.
+
+| File | Role |
+|---|---|
+| `tapengine.cpp/.h` | WASAPI capture thread (shared mode, raw stream when the driver allows it, mic picker, both channels of a mic array) |
+| `tapdetector.h` | High-pass, adaptive noise floor, onset + duration check, pattern grouping, left/right lag. No Windows/Qt deps. Tuning knobs are in `TapConfig`. |
+| `detector_test.cpp` | Detector check on synthetic audio (`ctest`) |
+| `mainwindow.cpp/.h` | Window, tray, action mapping (media keys, open an app, shortcut, command), calibration, settings in `%APPDATA%\tap-tap\tap-tap.ini` |
+| `widgets.h` | Light/dark colours and the custom-painted parts: laptop drawing, side tiles, popover, switch |
+| `ui_test.cpp` | Popover open/close behaviour, driven without showing the window (`ctest`). `ui_test <folder>` also saves pictures of the window. |
+
+Left/right: the laptop's mic array has two channels. Each tap's first 5 ms are cross-correlated between them;
+the lag (in samples, printed per tap in the activity log) says which mic heard it first. "Calibrate..." takes
+five taps per side and stores the dividing lag and its sign. **Not yet measured on real taps:** whether the
+lag separates the two sides on this laptop at all is unknown until a calibration has been run. Until then
+both sides carry the same actions, so a wrong guess changes nothing.
+
+Not built: tap intensity classes, ML classifier, tap-and-hold (a held finger makes no sound).
+Tuned against a 20 s recording of real double/triple taps on the palm rest (Realtek mic array, raw stream):
+taps are broadband clicks 15-20 ms long, about 200 ms apart, on top of loud low-frequency noise. High-passing
+at 4 kHz is what makes them detectable; at 150 Hz most were lost in the noise. All 4 doubles and 4 triples in
+that recording are recognised at onset ratios 3-5 (default 4), with no false triggers.
+
+Typing and mouse clicks are rejected by ignoring taps within 300 ms after any keyboard/mouse input, and by
+discarding a pending pattern if input arrives before it closes (a keystroke is heard before Windows reports it).
+Other sharp noises (clap, cup on the desk) still count as taps; single tap is unmapped by default for that reason.
 
 ## Core Concept
 - Continuously capture audio from the built-in microphone.
