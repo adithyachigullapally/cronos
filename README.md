@@ -9,6 +9,7 @@
   <img alt="Platform: Windows" src="https://img.shields.io/badge/platform-Windows-0078D4?logo=windows&logoColor=white">
   <img alt="C++17" src="https://img.shields.io/badge/C%2B%2B-17-00599C?logo=cplusplus&logoColor=white">
   <img alt="Qt 6" src="https://img.shields.io/badge/Qt-6-41CD52?logo=qt&logoColor=white">
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue"></a>
 </p>
 
 <p align="center">
@@ -136,3 +137,7 @@ The full checklist is in [`steps.md`](steps.md). Not built yet:
 ## Privacy
 
 Audio is analysed live on your computer and thrown away. Nothing is recorded, saved or sent anywhere, and the app makes no network connections. (The recording tool in `tuning/` only writes a file when you run it yourself.)
+
+## License
+
+[MIT](LICENSE)
