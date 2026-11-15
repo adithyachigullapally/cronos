@@ -14,13 +14,15 @@ their own actions, settings, tray.
 | `detector_test.cpp` | Detector check on synthetic audio (`ctest`) |
 | `mainwindow.cpp/.h` | Window, tray, action mapping (media keys, open an app, shortcut, command), calibration, settings in `%APPDATA%\tap-tap\tap-tap.ini` |
 | `widgets.h` | Light/dark colours and the custom-painted parts: laptop drawing, side tiles, popover, switch |
-| `ui_test.cpp` | Popover open/close behaviour, driven without showing the window (`ctest`). `ui_test <folder>` also saves pictures of the window. |
+| `ui_test.cpp` | Popover open/close behaviour, driven without showing the window (`ctest`). `ui_test <folder>` also saves pictures of the window (the README images in `docs/images`). |
+| `tuning/` | Recorder, replay and sweep tools for tuning the detector against recorded taps |
 
-Left/right: the laptop's mic array has two channels. Each tap's first 5 ms are cross-correlated between them;
-the lag (in samples, printed per tap in the activity log) says which mic heard it first. "Calibrate..." takes
-five taps per side and stores the dividing lag and its sign. **Not yet measured on real taps:** whether the
-lag separates the two sides on this laptop at all is unknown until a calibration has been run. Until then
-both sides carry the same actions, so a wrong guess changes nothing.
+Left/right: the laptop's mic array has two channels. Each tap's first 5 ms are cross-correlated between them
+(band-passed to 2-6 kHz); the lag (in samples, printed per tap in the activity log) says which mic heard it
+first. Measured on real taps on this laptop: left taps lag +2.1..+2.9 samples, right taps -2.3..-1.8, so the
+default dividing line of 0 works without calibrating. "Calibrate..." (five taps per side) is there for other
+laptops. Comparing above 4 kHz was tried first and failed on soft taps: they are dominated by a ~15 kHz ring,
+and matching on that slips by whole cycles. See `tuning/sweep.cpp` for how the band was chosen.
 
 Not built: tap intensity classes, ML classifier, tap-and-hold (a held finger makes no sound).
 Tuned against a 20 s recording of real double/triple taps on the palm rest (Realtek mic array, raw stream):
