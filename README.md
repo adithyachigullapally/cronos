@@ -1,4 +1,4 @@
-<h1 align="center">Tap Tap</h1>
+<h1 align="center">Cronos </h1>
 
 <p align="center">
   <b>Tap your laptop to control it.</b><br>
