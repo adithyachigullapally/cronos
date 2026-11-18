@@ -1,0 +1,3 @@
+// The icon Windows shows for cronos.exe and its shortcuts.
+// "ui_test docs/images" writes the .ico again from the drawing in mainwindow.cpp.
+IDI_ICON1 ICON "docs/images/cronos.ico"

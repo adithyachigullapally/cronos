@@ -19,7 +19,9 @@ struct TapConfig {
     float highpassHz = 4000.f;
     float onsetRatio = 4.f;     // block RMS must exceed noise floor * this (UI "sensitivity")
     float minRms = 0.002f;      // absolute floor, so a silent room can't trigger on nothing
-    float maxTapMs = 90.f;      // louder for longer than this = speech/music/scrape, not a tap
+    // Louder for longer than this = speech, a cough, a scrape, something put down:
+    // not a tap. Recorded taps last 5-25 ms; speech that got through at 40 lasted 38-42.
+    float maxTapMs = 30.f;
     float refractoryMs = 70.f;  // min spacing between tap onsets (covers chassis ringing)
     float patternGapMs = 400.f; // taps closer than this belong to one pattern
     // Left/right, two-channel mics only: the channels are cross-correlated over
@@ -35,6 +37,31 @@ struct TapConfig {
     float sideMaxLagMs = 0.15f; // search range; real lags here stay within 3 samples (0.06 ms)
     float sideLowHz = 2000.f;   // band the two channels are compared in
     float sideHighHz = 6000.f;
+    // Where taps come from: the lag a tap on each side measures (the app learns the
+    // two with "Calibrate..."). A sound further than sideTolerance from both did not
+    // come from either spot and is not counted. Both equal = not known, count
+    // everything. On the recordings taps stay within 0.65 of their side's usual lag,
+    // while hands moving and things nearby measured -0.1, -1.0, -3.9.
+    // ponytail: a sound arriving from the same direction as a palm rest still passes;
+    // telling those apart needs another cue (spectrum, decay), measured on recordings.
+    float sideLag[2] = {0, 0};
+    float sideTolerance = 0.75f;
+    // A tap shakes the chassis, so its click comes with a thump below 300 Hz. A sound
+    // that only arrives through the air (a hand slapped on a shoulder, a clap) is the
+    // click without the thump. A sound counts only if its thump (Tap::thumpDb) is at
+    // least this. Measured on recordings (tuning/replay.cpp): 69 taps -8.9 dB or more,
+    // five slaps on a shoulder -16 to -30, which is why the app uses -14.
+    // -200 = don't check, and it stays that until "Calibrate..." has run.
+    // ponytail: a soft sound passes whatever it is, room rumble stands in for the
+    // missing thump. A fingernail tap, or any tap on another laptop, is unmeasured:
+    // the app's log prints every sound's thump to check against.
+    float minThumpDb = -200.f;
+    // A tap makes the chassis ring, so above the high-pass its click crosses zero at
+    // 13-16 kHz (Tap::freqHz; 82 recorded taps, 13050 Hz the lowest). Speech and
+    // cracked knuckles reach the mic through the air without that ring: most measured
+    // 3-9 kHz. A sound counts only if its freqHz is at least this. 0 = don't check,
+    // and it stays that until "Calibrate..." has run: another chassis rings elsewhere.
+    float minRingHz = 0.f;
 };
 
 struct Tap {
@@ -42,6 +69,8 @@ struct Tap {
     float durationMs;
     float freqHz;     // zero-crossing estimate of dominant frequency (cheap spectral-centroid stand-in)
     float lag;        // samples by which channel 2 heard the tap after channel 1 (negative: before). 0 for mono.
+    float thumpDb;    // energy at 80-300 Hz around the click, relative to the click's own energy above the high-pass
+    bool counted;     // false: heard, but not a tap on a palm rest (see TapConfig::sideLag, minThumpDb, minRingHz), so left out of the pattern
 };
 
 class TapDetector
@@ -61,15 +90,20 @@ public:
     void process(const float *x, size_t n, bool suppress = false, const float *x2 = nullptr)
     {
         const Coef hp = coef(cfg.highpassHz, true), sideLo = coef(cfg.sideLowHz, true), sideHi = coef(cfg.sideHighHz, false);
+        const Coef thumpLo = coef(ThumpLowHz, true), thumpHi = coef(ThumpHighHz, false);
         const int blockLen = std::max(1, int(cfg.sampleRate * BlockMs / 1000.f));
         stereo_ = x2 != nullptr;
         for (size_t i = 0; i < n; ++i) {
-            float y = hp_[0].run(x[i], hp);
+            float y = hp_[0].run(x[i], hp), raw = x[i];
             if (x2) { // detect on the average of the two mics, keep each (in the side band) for the lag estimate
                 y = 0.5f * (y + hp_[1].run(x2[i], hp));
+                raw = 0.5f * (raw + x2[i]);
                 ring_[0][pos_ & RingMask] = sideHi_[0].run(sideLo_[0].run(x[i], sideLo), sideHi);
                 ring_[1][pos_ & RingMask] = sideHi_[1].run(sideLo_[1].run(x2[i], sideLo), sideHi);
             }
+            // Each filter twice: the rest of a loud click must not leak into the thump band.
+            const float low = thump_[3].run(thump_[2].run(thump_[1].run(thump_[0].run(raw, thumpLo), thumpLo), thumpHi), thumpHi);
+            sumSqLow_ += low * low;
             ++pos_;
             sumSq_ += y * y;
             blockPeak_ = std::max(blockPeak_, std::fabs(y));
@@ -86,6 +120,11 @@ private:
     static constexpr float BlockMs = 2.5f; // taps are over in a few ms; longer blocks dilute them
     static constexpr float WarmupMs = 300.f;
     static constexpr int64_t RingMask = 8191; // 170 ms at 48 kHz: a whole tap (maxTapMs) and then some
+    // The thump (see TapConfig::minThumpDb) is listened for from 5 ms before the click
+    // to 20 ms after its start. Measured on recordings: by the time the click has died
+    // (5-15 ms) the thump has not arrived yet, and past 20 ms room rumble only dilutes it.
+    static constexpr float ThumpLowHz = 80.f, ThumpHighHz = 300.f;
+    static constexpr int ThumpBlocks = 8;
 
     // 2nd-order Butterworth high- or low-pass (RBJ cookbook biquad); b2 == b0 for both
     struct Coef { float b0, b1, a1, a2; };
@@ -147,41 +186,62 @@ private:
             const float threshold = std::max(floor_ * cfg.onsetRatio, cfg.minRms);
             // The first WarmupMs only teach the noise floor; a stream starting in
             // a noisy room would otherwise open with a false tap.
-            if (rms > threshold && now_ >= WarmupMs && now_ - lastOnset_ >= cfg.refractoryMs) {
+            if (rms > threshold && now_ >= WarmupMs && now_ - lastOnset_ >= cfg.refractoryMs && !pending_) {
                 inEvent_ = true;
                 evStart_ = now_ - BlockMs;
                 evPos_ = pos_ - blockN_;
                 evBlocks_ = 0;
-                evPeak_ = evPeakRms_ = 0;
+                evPeak_ = evPeakRms_ = evEnergy_ = 0;
                 evZc_ = 0;
+                evLow_ = lowBefore_[0] + lowBefore_[1];
+                lowBlocks_ = 0;
             } else {
                 // Noise floor: falls fast (50 ms) but rises slowly (500 ms), so the
                 // ringing of one tap can't lift it above a softer second tap.
                 floor_ += (rms < floor_ || now_ < WarmupMs ? 0.05f : 0.005f) * (rms - floor_);
             }
         }
+        if (lowBlocks_ < ThumpBlocks) { // listening for the thump, whether or not the click is still going
+            evLow_ += sumSqLow_;
+            ++lowBlocks_;
+        }
         if (inEvent_) {
             ++evBlocks_;
             evPeak_ = std::max(evPeak_, blockPeak_);
             evPeakRms_ = std::max(evPeakRms_, rms);
+            evEnergy_ += sumSq_;
             evZc_ += zeroCrossings_;
-            const float dur = evBlocks_ * BlockMs;
             // Over once it has died away, or (for a tap barely above the noise) sunk back into it.
             if (rms < std::max(evPeakRms_ * 0.25f, floor_ * 2.f)) {
                 inEvent_ = false;
                 lastOnset_ = evStart_;
-                if (!suppress) {
-                    const float lag = onsetLag();
-                    ++count_;
-                    lagSum_ += lag;
-                    lastTap_ = now_;
-                    if (onTap)
-                        onTap({evPeak_, dur, evZc_ / (2.f * dur / 1000.f), lag});
-                }
-            } else if (dur > cfg.maxTapMs) { // sustained sound, not a tap
+                pending_ = true; // whether it counts is decided once the thump has had its time
+                evEnd_ = now_;
+                evSuppress_ = suppress;
+                evLag_ = onsetLag();
+            } else if (evBlocks_ * BlockMs > cfg.maxTapMs) { // sustained sound, not a tap
                 inEvent_ = false;
                 lastOnset_ = now_;
                 floor_ = rms; // adopt it as the new floor so it can't retrigger
+            }
+        }
+        if (pending_ && lowBlocks_ >= ThumpBlocks) {
+            pending_ = false;
+            if (!evSuppress_ && !suppress) {
+                const float dur = evBlocks_ * BlockMs;
+                const float thump = 10.f * std::log10((evLow_ + 1e-12f) / (evEnergy_ + 1e-12f));
+                const float hz = evZc_ / (2.f * dur / 1000.f);
+                const bool counted = thump >= cfg.minThumpDb && hz >= cfg.minRingHz
+                    && (!stereo_ || cfg.sideLag[0] == cfg.sideLag[1]
+                        || std::fabs(evLag_ - cfg.sideLag[0]) <= cfg.sideTolerance
+                        || std::fabs(evLag_ - cfg.sideLag[1]) <= cfg.sideTolerance);
+                if (counted) {
+                    ++count_;
+                    lagSum_ += evLag_;
+                    lastTap_ = evEnd_;
+                }
+                if (onTap)
+                    onTap({evPeak_, dur, hz, evLag_, thump, counted});
             }
         }
         if (count_ && suppress) {
@@ -190,30 +250,34 @@ private:
             if (onPattern)
                 onPattern(0, 0);
         }
-        if (count_ && !inEvent_ && now_ - lastTap_ > cfg.patternGapMs) {
+        if (count_ && !inEvent_ && !pending_ && now_ - lastTap_ > cfg.patternGapMs) {
             if (onPattern)
                 onPattern(count_, lagSum_ / count_);
             count_ = 0;
             lagSum_ = 0;
         }
-        sumSq_ = blockPeak_ = 0;
+        lowBefore_[0] = lowBefore_[1];
+        lowBefore_[1] = sumSqLow_;
+        sumSq_ = blockPeak_ = sumSqLow_ = 0;
         blockN_ = zeroCrossings_ = 0;
     }
 
-    Biquad hp_[2], sideLo_[2], sideHi_[2];
+    Biquad hp_[2], sideLo_[2], sideHi_[2], thump_[4];
     float ring_[2][RingMask + 1] = {}; // recent side-band samples of each channel
     int64_t pos_ = 0, evPos_ = 0;      // samples processed; where the current tap began
     bool stereo_ = false;
     float lagSum_ = 0;
-    float sumSq_ = 0, blockPeak_ = 0;
+    float sumSq_ = 0, blockPeak_ = 0, sumSqLow_ = 0;
+    float lowBefore_[2] = {0, 0}; // thump-band energy of the two blocks before this one
     int blockN_ = 0, zeroCrossings_ = 0;
     bool positive_ = true;
 
-    double now_ = 0, lastOnset_ = -1e9, lastTap_ = 0, evStart_ = 0; // ms of audio processed
+    double now_ = 0, lastOnset_ = -1e9, lastTap_ = 0, evStart_ = 0, evEnd_ = 0; // ms of audio processed
     float floor_ = 0;
     bool inEvent_ = false;
-    int evBlocks_ = 0, evZc_ = 0, count_ = 0;
-    float evPeak_ = 0, evPeakRms_ = 0;
+    bool pending_ = false, evSuppress_ = false; // the click is over, the thump is still being listened for
+    int evBlocks_ = 0, evZc_ = 0, count_ = 0, lowBlocks_ = ThumpBlocks;
+    float evPeak_ = 0, evPeakRms_ = 0, evEnergy_ = 0, evLow_ = 0, evLag_ = 0;
 };
 
 #endif // TAPDETECTOR_H

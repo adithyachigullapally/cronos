@@ -26,13 +26,15 @@ int main(int argc, char *argv[])
     applyTheme(a);
     QTemporaryDir settings; // start from defaults, with the microphone off
     QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, settings.path());
-    QSettings(QSettings::IniFormat, QSettings::UserScope, "tap-tap", "tap-tap").setValue("enabled", false);
+    QSettings(QSettings::IniFormat, QSettings::UserScope, "cronos", "cronos").setValue("enabled", false);
 
     MainWindow w;
     const QPixmap picture = w.grab(); // also lays the window out, which placing a popover relies on
     if (argc > 1) {
         const QString folder = QString::fromLocal8Bit(argv[1]);
         picture.save(folder + "/main.png");
+        // ponytail: one 256 px image, Windows scales it down for small sizes; add 16/32/48 if those look soft.
+        w.windowIcon().pixmap(256, 256).save(folder + "/cronos.ico");
         w.showPopover(0);
         w.grab().save(folder + "/left.png");
         w.showPopover(1);

@@ -8,7 +8,6 @@
 #include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
-#include <QFormLayout>
 #include <QGridLayout>
 #include <QKeySequenceEdit>
 #include <QLabel>
@@ -17,16 +16,17 @@
 #include <QMenu>
 #include <QPlainTextEdit>
 #include <QProcess>
-#include <QPropertyAnimation>
 #include <QPushButton>
 #include <QSettings>
 #include <QSlider>
+#include <QStyledItemDelegate>
 #include <QSystemTrayIcon>
 #include <QTime>
 
 #include <algorithm>
 #include <cmath>
 #include <windows.h>
+#include <dwmapi.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
@@ -41,6 +41,37 @@ enum { Left, Right };
 static const char *const patternNames[] = {QT_TR_NOOP("Single tap"), QT_TR_NOOP("Double tap"),
                                            QT_TR_NOOP("Triple tap")};
 static const char *const sideNames[] = {QT_TR_NOOP("Left side"), QT_TR_NOOP("Right side")};
+
+// Programs listed here are started by Windows when the user signs in.
+static const char *const runKey = "HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static const char *const runName = "Cronos";
+
+// A second launch posts this to every window; the copy already running shows itself.
+static const UINT showMessage = RegisterWindowMessageW(L"cronos-show");
+
+bool MainWindow::alreadyRunning()
+{
+    CreateMutexW(nullptr, FALSE, L"cronos-running"); // held until this process ends
+    if (GetLastError() != ERROR_ALREADY_EXISTS)
+        return false;
+    AllowSetForegroundWindow(ASFW_ANY); // or Windows would only flash that copy's taskbar button
+    PostMessageW(HWND_BROADCAST, showMessage, 0, 0);
+    return true;
+}
+
+// Dropdown whose list has rounded rows and, on Windows 11, rounded corners.
+class Combo : public QComboBox
+{
+public:
+    Combo() { setItemDelegate(new QStyledItemDelegate(this)); } // the default one ignores the style sheet's row rules
+    void showPopup() override
+    {
+        const int roundSmall = 3; // DWMWCP_ROUNDSMALL; older Windows ignores the request
+        DwmSetWindowAttribute(HWND(view()->window()->winId()), 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */, &roundSmall,
+                              sizeof(roundSmall));
+        QComboBox::showPopup();
+    }
+};
 
 // ponytail: virtual-key codes only. Games that read scan codes won't see these;
 // fill in ki.wScan via MapVirtualKey if that ever matters.
@@ -223,10 +254,11 @@ static bool chooseApp(QWidget *parent, QString *name, QString *target)
 
 static QIcon appIcon() // window and tray: tap ripples on a blue tile
 {
-    QPixmap pixmap(64, 64);
+    QPixmap pixmap(256, 256); // drawn on a 64-unit grid; big enough for cronos.ico, which ui_test saves from this
     pixmap.fill(Qt::transparent);
     QPainter p(&pixmap);
     p.setRenderHint(QPainter::Antialiasing);
+    p.scale(4, 4);
     QLinearGradient blue(0, 0, 0, 64);
     blue.setColorAt(0, "#40a6ff");
     blue.setColorAt(1, "#0a6cf0");
@@ -251,23 +283,34 @@ static QString signedNumber(float v) // "+2.4", "-0.3"
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
 {
-    setWindowTitle(tr("Tap Tap"));
+    setWindowTitle(tr("Cronos"));
     const QIcon icon = appIcon();
     setWindowIcon(icon);
 
-    // Header: name, engine status, master switch
-    auto *title = new QLabel(tr("Tap Tap"));
+    winId(); // a real window from the start, even if never shown: nativeEvent() needs one to be reached
+
+    // Header: icon, name, engine status, master switch
+    auto *logo = new QLabel;
+    logo->setPixmap(icon.pixmap(QSize(40, 40), qApp->devicePixelRatio()));
+    auto *title = new QLabel(tr("Cronos"));
     title->setObjectName("title");
-    auto *statusLabel = new QLabel(tr("Stopped"));
+    auto *statusLabel = new QLabel;
     statusLabel->setObjectName("sub");
     statusLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred); // a long mic name must not widen the window
+    auto showStatus = [statusLabel](const QString &text) { // with a dot: green listening, grey stopped, orange in trouble
+        const char *dot = text.startsWith("Listening") ? "#30d158" : text == "Stopped" ? "#8e8e93" : "#ff9f0a";
+        statusLabel->setText(QStringLiteral("<span style='color:%1'>●</span>&nbsp; %2").arg(QLatin1String(dot), text.toHtmlEscaped()));
+    };
+    showStatus(QStringLiteral("Stopped"));
     auto *names = new QVBoxLayout;
-    names->setSpacing(2);
+    names->setSpacing(0);
     names->addWidget(title);
     names->addWidget(statusLabel);
     enabled = new Switch;
     enabled->setAccessibleName(tr("Listen for taps"));
     auto *header = new QHBoxLayout;
+    header->setSpacing(12);
+    header->addWidget(logo);
     header->addLayout(names, 1);
     header->addWidget(new QLabel(tr("Listen for taps")));
     header->addWidget(enabled);
@@ -284,7 +327,7 @@ MainWindow::MainWindow(QWidget *parent)
     for (int side = 0; side < 2; ++side) {
         ZoneTile *tile = tiles[side] = new ZoneTile;
         tile->title = tr(sideNames[side]);
-        tile->footer = tr("Change...");
+        tile->hint = tr("Change...");
         tile->setAccessibleName(tr("%1 actions").arg(tile->title));
         for (const char *name : patternNames)
             tile->names << tr(name);
@@ -298,35 +341,50 @@ MainWindow::MainWindow(QWidget *parent)
     // With earphones plugged in, Windows' default is usually the earphone mic,
     // which can't hear the chassis; the built-in one has to be picked here.
     // ponytail: list is read once at startup; restart to see a newly plugged mic.
-    mic = new QComboBox;
+    mic = new Combo;
+    mic->setFixedWidth(330);
     mic->addItem(tr("Windows default"), QString());
     for (const TapEngine::Mic &m : TapEngine::microphones())
         mic->addItem(m.name, m.id);
     sensitivity = new QSlider(Qt::Horizontal);
     sensitivity->setRange(0, 100);
+    sensitivity->setFixedWidth(330);
     ignoreInput = new Switch;
     ignoreInput->setAccessibleName(tr("Ignore taps while typing or using the mouse"));
-    auto *ignoreRow = new QHBoxLayout;
-    ignoreRow->addWidget(new QLabel(ignoreInput->accessibleName()), 1);
-    ignoreRow->addWidget(ignoreInput);
     sideStatus = new QLabel;
     sideStatus->setObjectName("sub");
     calibrateButton = new QPushButton(tr("Calibrate..."));
-    auto *sideRow = new QHBoxLayout;
-    sideRow->addWidget(new QLabel(tr("Left and right")));
-    sideRow->addSpacing(8);
-    sideRow->addWidget(sideStatus, 1);
-    sideRow->addWidget(calibrateButton);
-    auto *card = new QFrame;
-    card->setObjectName("card");
-    auto *form = new QFormLayout(card);
-    form->setContentsMargins(16, 12, 16, 12);
-    form->setHorizontalSpacing(16);
-    form->setVerticalSpacing(8);
-    form->addRow(tr("Microphone"), mic);
-    form->addRow(tr("Sensitivity"), sensitivity);
-    form->addRow(ignoreRow);
-    form->addRow(sideRow);
+    // Only a copy with Qt's files beside it can start by itself. One run from Qt
+    // Creator can't, so it must not put itself in the list.
+    const bool installed = QFileInfo::exists(QCoreApplication::applicationDirPath() + "/platforms");
+    auto *startup = new Switch;
+    startup->setAccessibleName(tr("Start when I sign in to Windows"));
+    startup->setChecked(QSettings(runKey, QSettings::NativeFormat).contains(runName));
+    startup->setEnabled(installed);
+    connect(startup, &QAbstractButton::toggled, this, [](bool on) {
+        QSettings run(runKey, QSettings::NativeFormat);
+        if (on)
+            run.setValue(runName, QStringLiteral("\"%1\" --hidden").arg(QDir::toNativeSeparators(QCoreApplication::applicationFilePath())));
+        else
+            run.remove(runName);
+    });
+    auto *startupNote = new QLabel(installed ? QString() : tr("Only in the installed app (install.ps1)"));
+    startupNote->setObjectName("sub");
+    auto *card = new Card;
+    auto addRow = [card](const QString &label, QWidget *note, QWidget *control) { // name, grey note, control at the right
+        QHBoxLayout *row = card->addRow();
+        row->addWidget(new QLabel(label));
+        if (note)
+            row->addWidget(note, 1);
+        else
+            row->addStretch(1);
+        row->addWidget(control);
+    };
+    addRow(tr("Microphone"), nullptr, mic);
+    addRow(tr("Sensitivity"), nullptr, sensitivity);
+    addRow(ignoreInput->accessibleName(), nullptr, ignoreInput);
+    addRow(tr("Left and right"), sideStatus, calibrateButton);
+    addRow(startup->accessibleName(), startupNote, startup);
 
     // Per-tap numbers, for tuning. Hidden until asked for.
     activity = new QPushButton(tr("Show activity"));
@@ -336,12 +394,12 @@ MainWindow::MainWindow(QWidget *parent)
     log = new QPlainTextEdit;
     log->setReadOnly(true);
     log->setMaximumBlockCount(500);
-    log->setMinimumHeight(110);
+    log->setMinimumHeight(96);
     log->hide();
 
     auto *central = new QWidget;
     auto *layout = new QVBoxLayout(central);
-    layout->setContentsMargins(20, 14, 20, 20); // the bottom leaves room for an open popover's shadow
+    layout->setContentsMargins(22, 14, 22, 20); // the bottom leaves room for an open popover's shadow
     layout->setSpacing(12);
     layout->addLayout(header);
     layout->addLayout(stage);
@@ -350,16 +408,17 @@ MainWindow::MainWindow(QWidget *parent)
     layout->addWidget(log, 1);
     layout->addStretch();
     setCentralWidget(central);
+    central->setFocus(); // or the first switch starts out with a focus ring nobody asked for
 
     // One popover per side: what single, double and triple taps there do
     for (int side = 0; side < 2; ++side) {
         Popover *pop = popovers[side] = new Popover(central);
         pop->hide();
-        pop->setFixedWidth(500);
+        pop->setFixedWidth(510);
         auto *grid = new QGridLayout(pop);
-        grid->setContentsMargins(Popover::Pad + 18, Popover::Pad + Popover::Arrow + 14, Popover::Pad + 18, Popover::Pad + 16);
-        grid->setHorizontalSpacing(12);
-        grid->setVerticalSpacing(8);
+        grid->setContentsMargins(Popover::Pad + 20, Popover::Pad + Popover::Arrow + 16, Popover::Pad + 20, Popover::Pad + 18);
+        grid->setHorizontalSpacing(14);
+        grid->setVerticalSpacing(9);
         auto *head = new QLabel(tr(sideNames[side]));
         head->setObjectName("popTitle");
         auto *hint = new QLabel(tr("Choose what taps on this side of the laptop do."));
@@ -369,8 +428,8 @@ MainWindow::MainWindow(QWidget *parent)
         grid->setRowMinimumHeight(2, 4);
         for (int i = 0; i < 3; ++i) {
             ActionRow &row = rows[side][i];
-            row.kind = new QComboBox;
-            row.kind->setFixedWidth(160);
+            row.kind = new Combo;
+            row.kind->setFixedWidth(196);
             row.kind->addItem(tr("Do nothing"), NoAction);
             row.kind->addItem(tr("Play / Pause"), VK_MEDIA_PLAY_PAUSE);
             row.kind->addItem(tr("Next track"), VK_MEDIA_NEXT_TRACK);
@@ -412,33 +471,32 @@ MainWindow::MainWindow(QWidget *parent)
     // Tray: the app keeps listening with the window closed.
     qApp->setQuitOnLastWindowClosed(false);
     tray = new QSystemTrayIcon(icon, this);
-    tray->setToolTip(tr("Tap Tap"));
+    tray->setToolTip(tr("Cronos"));
     auto *menu = new QMenu(this);
     QAction *toggle = menu->addAction(tr("Listen for taps"));
     toggle->setCheckable(true);
     connect(toggle, &QAction::toggled, enabled, &QAbstractButton::setChecked);
     connect(enabled, &QAbstractButton::toggled, toggle, &QAction::setChecked);
-    auto reveal = [this] {
-        showNormal();
-        raise();
-        activateWindow();
-    };
-    menu->addAction(tr("Show window"), this, reveal);
+    menu->addAction(tr("Show window"), this, &MainWindow::reveal);
     menu->addAction(tr("Quit"), qApp, &QCoreApplication::quit);
     tray->setContextMenu(menu);
-    connect(tray, &QSystemTrayIcon::activated, this, [reveal](QSystemTrayIcon::ActivationReason why) {
+    connect(tray, &QSystemTrayIcon::activated, this, [this](QSystemTrayIcon::ActivationReason why) {
         if (why == QSystemTrayIcon::Trigger)
             reveal();
     });
     tray->show();
 
-    connect(&engine, &TapEngine::status, statusLabel, &QLabel::setText);
+    connect(&engine, &TapEngine::status, statusLabel, showStatus);
     connect(&engine, &TapEngine::level, laptop, [this](float peak) { // -60..0 dB across the meter
         laptop->setLevel(peak > 0 ? qBound(0.f, 1 + std::log10(peak) / 3, 1.f) : 0);
     });
-    connect(&engine, &TapEngine::tap, this, [this](float peak, float ms, float hz, float lag) {
-        say(tr("tap   peak %1   %2 ms   ~%3 Hz   lag %4")
-                .arg(peak, 0, 'f', 3).arg(int(ms)).arg(int(hz)).arg(signedNumber(lag)));
+    connect(&engine, &TapEngine::tap, this, [this](float peak, float ms, float hz, float lag, float thump, bool counted) {
+        say((counted ? tr("tap")
+             : thump < engine.minThump ? tr("ignored - no thump, so not a tap on the laptop")
+             : hz < engine.minRingHz   ? tr("ignored - the laptop did not ring, so not a tap on it")
+                                       : tr("ignored - not from a palm rest"))
+            + tr("   peak %1   %2 ms   ~%3 Hz   lag %4   thump %5 dB")
+                  .arg(peak, 0, 'f', 3).arg(int(ms)).arg(int(hz)).arg(signedNumber(lag), signedNumber(thump)));
     });
     connect(&engine, &TapEngine::pattern, this, &MainWindow::onPattern);
     connect(calibrateButton, &QPushButton::clicked, this, &MainWindow::calibrate);
@@ -457,23 +515,43 @@ MainWindow::MainWindow(QWidget *parent)
         }
     }
     settingsChanged();
-    resize(740, minimumSizeHint().height());
+    resize(790, minimumSizeHint().height());
 }
 
-// Settings live in %APPDATA%\tap-tap\tap-tap.ini
-static const char *const org = "tap-tap";
+void MainWindow::reveal()
+{
+    showNormal();
+    raise();
+    activateWindow();
+}
+
+bool MainWindow::nativeEvent(const QByteArray &type, void *message, qintptr *result)
+{
+    if (static_cast<MSG *>(message)->message == showMessage)
+        reveal();
+    return QMainWindow::nativeEvent(type, message, result);
+}
+
+// Settings live in %APPDATA%\cronos\cronos.ini
+static const char *const org = "cronos";
 
 void MainWindow::load()
 {
     const QSettings s(QSettings::IniFormat, QSettings::UserScope, org, org);
     enabled->setChecked(s.value("enabled", true).toBool());
     mic->setCurrentIndex(qMax(0, mic->findData(s.value("microphone").toString()))); // unplugged -> default
-    sensitivity->setValue(s.value("sensitivity2", 70).toInt());
+    // 35 is onset ratio ~9: on the recordings in tuning/ every tap is heard with the right
+    // count, while 70 (ratio 4) also picks up finger-contact noise as extra taps.
+    sensitivity->setValue(s.value("sensitivity2", 35).toInt());
     ignoreInput->setChecked(s.value("ignoreInput", true).toBool());
     activity->setChecked(s.value("showLog", false).toBool());
     sideCenter = s.value("side/center", 0.f).toFloat();
     leftFirst = s.value("side/leftFirst", true).toBool();
     calibrated = s.value("side/calibrated", false).toBool();
+    sideLags[Left] = s.value("side/left", 0.f).toFloat();
+    sideLags[Right] = s.value("side/right", 0.f).toFloat();
+    minThump = s.value("side/thump", -200.f).toFloat();
+    minRing = s.value("side/ring", 0.f).toFloat();
     // Single tap does nothing by default: one stray knock is too easy to make.
     const int defaults[] = {NoAction, VK_MEDIA_PLAY_PAUSE, VK_MEDIA_NEXT_TRACK};
     for (int side = 0; side < 2; ++side) {
@@ -494,9 +572,16 @@ void MainWindow::load()
 
 void MainWindow::settingsChanged()
 {
-    // Slider 0..100 -> onset ratio 20..2 (log scale); 70 is the detector default of ~4.
+    // Slider 0..100 -> onset ratio 20..2 (log scale).
     engine.onsetRatio = 2.f * std::pow(10.f, (100 - sensitivity->value()) / 100.f);
     engine.ignoreWhileInput = ignoreInput->isChecked();
+    // Only sounds from where the calibration taps came from, with a thump like
+    // theirs, count. Not while calibrating: a wrong calibration could then never
+    // be replaced.
+    engine.sideLagLeft = calibrating ? 0 : sideLags[Left];
+    engine.sideLagRight = calibrating ? 0 : sideLags[Right];
+    engine.minThump = calibrating ? -200.f : minThump;
+    engine.minRingHz = calibrating ? 0.f : minRing;
     const QString micId = mic->currentData().toString();
     if (!enabled->isChecked() || micId != engine.deviceId)
         engine.stop(); // releases the microphone
@@ -507,7 +592,9 @@ void MainWindow::settingsChanged()
     laptop->listening = enabled->isChecked();
     laptop->update();
     calibrateButton->setEnabled(enabled->isChecked());
-    sideStatus->setText(calibrated ? tr("Calibrated on this laptop") : tr("Not calibrated yet, sides are a first guess"));
+    sideStatus->setText(sideLags[Left] != sideLags[Right] ? tr("Calibrated: sounds from elsewhere are ignored")
+                        : calibrated ? tr("Calibrated on this laptop")
+                                     : tr("Not calibrated yet, sides are a first guess"));
     if (log->isHidden() == activity->isChecked()) {
         log->setVisible(activity->isChecked());
         activity->setText(activity->isChecked() ? tr("Hide activity") : tr("Show activity"));
@@ -523,6 +610,10 @@ void MainWindow::settingsChanged()
     s.setValue("side/center", double(sideCenter));
     s.setValue("side/leftFirst", leftFirst);
     s.setValue("side/calibrated", calibrated);
+    s.setValue("side/left", double(sideLags[Left]));
+    s.setValue("side/right", double(sideLags[Right]));
+    s.setValue("side/thump", double(minThump));
+    s.setValue("side/ring", double(minRing));
     for (int side = 0; side < 2; ++side) {
         QStringList summary;
         for (int i = 0; i < 3; ++i) {
@@ -616,11 +707,9 @@ void MainWindow::onPattern(int count, float lag)
 void MainWindow::showPopover(int side)
 {
     activeSide = side;
-    laptop->active = side;
-    laptop->update();
+    laptop->setActive(side);
     for (int s = 0; s < 2; ++s) {
-        tiles[s]->active = s == side;
-        tiles[s]->update();
+        tiles[s]->setActive(s == side);
         popovers[s]->setVisible(false);
     }
     if (side < 0)
@@ -633,15 +722,7 @@ void MainWindow::showPopover(int side)
     const int x = qBound(4, anchor.x() - pop->width() / 2, area->width() - pop->width() - 4);
     const QPoint at(x, anchor.y() + 2 - Popover::Pad);
     pop->arrowX = anchor.x() - x;
-    pop->move(at);
-    pop->raise();
-    pop->show();
-    auto *slide = new QPropertyAnimation(pop, "pos", pop);
-    slide->setDuration(150);
-    slide->setEasingCurve(QEasingCurve::OutCubic);
-    slide->setStartValue(at - QPoint(0, 8));
-    slide->setEndValue(at);
-    slide->start(QAbstractAnimation::DeleteWhenStopped);
+    pop->appear(at);
 }
 
 bool MainWindow::eventFilter(QObject *object, QEvent *event)
@@ -689,6 +770,7 @@ void MainWindow::calibrate()
     layout->addWidget(buttons);
 
     QList<float> lags[2];
+    QList<float> thumps, rings; // of all ten taps
     auto prompt = [&] {
         const int side = lags[Left].size() < Needed ? Left : Right;
         text->setText(tr("<h3>Tap the %1 palm rest</h3>One tap at a time, about a second apart, "
@@ -700,10 +782,12 @@ void MainWindow::calibrate()
     else
         text->setText(tr("<h3>Not possible with this microphone</h3>It has a single channel, so there is "
                          "nothing to compare. A built-in microphone array is needed to tell left from right."));
-    connect(&engine, &TapEngine::tap, &dialog, [&](float, float, float, float lag) {
+    connect(&engine, &TapEngine::tap, &dialog, [&](float, float, float hz, float lag, float thump, bool) {
         if (!engine.stereo || lags[Right].size() == Needed)
             return;
         lags[lags[Left].size() < Needed ? Left : Right] << lag;
+        thumps << thump;
+        rings << hz;
         if (lags[Right].size() < Needed) {
             prompt();
             return;
@@ -727,16 +811,37 @@ void MainWindow::calibrate()
         } else {
             sideCenter = center;
             leftFirst = left > right;
+            sideLags[Left] = left;
+            sideLags[Right] = right;
+            // -14 dB is what the recordings in tuning/ support (TapConfig::minThumpDb):
+            // 69 taps measured -8.9 or more, slaps on a shoulder -16 to -30. These ten
+            // taps may loosen that for a laptop whose thump is weaker, never tighten
+            // it: taps spread over 15 dB, more than ten of them show. The third
+            // lowest, so that a cough or two in between cannot switch the check off.
+            // ponytail: the 6 is the most that still gives -14 from any ten of the
+            // recorded taps (third lowest of them all: -7.9). On a laptop where this
+            // rule does loosen, nothing has been measured; go by the log there.
+            std::sort(thumps.begin(), thumps.end());
+            minThump = std::min(-14.f, thumps[2] - 6.f);
+            // The same for the ring (TapConfig::minRingHz): 12500 Hz on the recordings
+            // (taps 13050 Hz and up, third lowest of them all 13667; speech and cracked
+            // knuckles that got through the other checks 3300-12450).
+            std::sort(rings.begin(), rings.end());
+            minRing = std::min(12500.f, rings[2] - 1000.f);
             calibrated = true;
             settingsChanged();
+            say(tr("Sounds with a thump under %1 dB or a ring under %2 Hz are ignored.")
+                    .arg(signedNumber(minThump)).arg(int(minRing)));
             text->setText(tr("<h3>Calibrated</h3>%1 %2 of %3 taps land on the correct side.")
                               .arg(numbers).arg(correct).arg(2 * Needed));
         }
         say(numbers);
     });
     calibrating = true;
+    settingsChanged(); // hear everything meanwhile
     dialog.exec();
     calibrating = false;
+    settingsChanged();
 }
 
 void MainWindow::say(const QString &line)
@@ -755,6 +860,6 @@ void MainWindow::closeEvent(QCloseEvent *event)
     static bool told = false;
     if (!told) {
         told = true;
-        tray->showMessage(tr("Tap Tap"), tr("Still listening. Right-click the tray icon to quit."));
+        tray->showMessage(tr("Cronos"), tr("Still listening. Right-click the tray icon to quit."));
     }
 }

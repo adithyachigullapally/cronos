@@ -36,11 +36,13 @@ struct Result {
 
 // suppressFrom: sample index at which keyboard/mouse input starts being reported.
 // s2: the second mic of a two-channel array.
-static Result run(const std::vector<float> &s, size_t suppressFrom = SIZE_MAX, const std::vector<float> *s2 = nullptr)
+static Result run(const std::vector<float> &s, size_t suppressFrom = SIZE_MAX, const std::vector<float> *s2 = nullptr,
+                  const TapConfig &cfg = {})
 {
     Result r;
     TapDetector d;
-    d.onTap = [&](const Tap &) { ++r.taps; };
+    d.cfg = cfg;
+    d.onTap = [&](const Tap &t) { r.taps += t.counted; };
     d.onPattern = [&](int n, float lag) {
         r.patterns.push_back(n);
         r.lag = lag;
@@ -136,6 +138,48 @@ int main()
         r = run(far, SIZE_MAX, &near);
         CHECK(r.patterns == std::vector<int>{2});
         CHECK(std::fabs(r.lag + 4) < 0.5f);
+    }
+    { // once it is known where taps come from, a sound from somewhere else is not one
+        TapConfig cfg;
+        cfg.sideLag[0] = 4;
+        cfg.sideLag[1] = -4;
+        auto near = room(2);
+        addTap(near, 0.5f);
+        const auto fromTheSide = delayed(near, 4), fromTheFront = delayed(near, 0);
+        CHECK(run(near, SIZE_MAX, &fromTheSide, cfg).patterns == std::vector<int>{1});
+        Result r = run(near, SIZE_MAX, &fromTheFront, cfg);
+        CHECK(r.taps == 0 && r.patterns.empty());
+    }
+    { // a tap shakes the laptop, so its click comes with a thump; the same click without one came through the air
+        TapConfig cfg;
+        cfg.minThumpDb = -14;
+        auto s = room(2);
+        addTap(s, 0.5f);
+        Result r = run(s, SIZE_MAX, nullptr, cfg);
+        CHECK(r.taps == 0 && r.patterns.empty());
+        for (int i = 0; i < SR / 20; ++i) // the thump: 150 Hz, dying away over 10 ms
+            s[SR / 2 + i] += 0.3f * std::sin(2 * 3.14159265f * 150 * i / SR) * std::exp(-i / (0.01f * SR));
+        CHECK(run(s, SIZE_MAX, nullptr, cfg).patterns == std::vector<int>{1});
+    }
+    { // something that rings on for 35 ms (a spoken consonant, a cough) is too long for a tap
+        auto s = room(2);
+        for (int i = SR / 2; i < SR / 2 + SR * 35 / 1000; ++i)
+            s[i] += 0.3f * noise();
+        Result r = run(s);
+        CHECK(r.taps == 0 && r.patterns.empty());
+    }
+    { // a tap makes the laptop ring high; a click through the air (speech, a knuckle) is lower
+        TapConfig cfg;
+        cfg.minRingHz = 12500;
+        auto click = [](float hz) {
+            auto s = room(2);
+            for (int i = 0; i < SR / 50; ++i)
+                s[SR / 2 + i] += 0.3f * std::sin(2 * 3.14159265f * hz * i / SR) * std::exp(-i / (0.003f * SR));
+            return s;
+        };
+        CHECK(run(click(15000), SIZE_MAX, nullptr, cfg).patterns == std::vector<int>{1});
+        Result r = run(click(7000), SIZE_MAX, nullptr, cfg);
+        CHECK(r.taps == 0 && r.patterns.empty());
     }
     std::printf("detector_test: all passed\n");
     return 0;

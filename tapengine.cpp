@@ -157,14 +157,21 @@ QString TapEngine::capture(void *event)
 
     TapDetector detector;
     detector.cfg.sampleRate = SampleRate;
-    detector.onTap = [this](const Tap &t) { emit tap(t.peak, t.durationMs, t.freqHz, t.lag); };
+    detector.onTap = [this](const Tap &t) { emit tap(t.peak, t.durationMs, t.freqHz, t.lag, t.thumpDb, t.counted); };
     detector.onPattern = [this](int n, float lag) { emit pattern(n, lag); };
 
     std::vector<float> left, right;
     float meterPeak = 0;
     int meterFrames = 0;
+    int quiet = 0; // waits in a row that timed out
     while (!isInterruptionRequested()) {
-        WaitForSingleObject(event, 200);
+        // A running stream signals every few milliseconds, silence included. If it
+        // stops without an error (seen after sleep on some drivers), open it again.
+        quiet = WaitForSingleObject(event, 200) == WAIT_TIMEOUT ? quiet + 1 : 0;
+        if (quiet >= 25) {
+            client->Stop();
+            return QStringLiteral("The microphone stopped delivering sound");
+        }
         UINT32 packet = 0;
         while (SUCCEEDED(hr = captureClient->GetNextPacketSize(&packet)) && packet) {
             BYTE *data = nullptr;
@@ -182,6 +189,10 @@ QString TapEngine::capture(void *event)
                 }
             }
             detector.cfg.onsetRatio = onsetRatio;
+            detector.cfg.sideLag[0] = sideLagLeft;
+            detector.cfg.sideLag[1] = sideLagRight;
+            detector.cfg.minThumpDb = minThump;
+            detector.cfg.minRingHz = minRingHz;
             detector.process(left.data(), frames, ignoreWhileInput && userInputActive(),
                              stereo ? right.data() : nullptr);
 

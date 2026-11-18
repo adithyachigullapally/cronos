@@ -12,16 +12,19 @@ their own actions, settings, tray.
 | `tapengine.cpp/.h` | WASAPI capture thread (shared mode, raw stream when the driver allows it, mic picker, both channels of a mic array) |
 | `tapdetector.h` | High-pass, adaptive noise floor, onset + duration check, pattern grouping, left/right lag. No Windows/Qt deps. Tuning knobs are in `TapConfig`. |
 | `detector_test.cpp` | Detector check on synthetic audio (`ctest`) |
-| `mainwindow.cpp/.h` | Window, tray, action mapping (media keys, open an app, shortcut, command), calibration, settings in `%APPDATA%\tap-tap\tap-tap.ini` |
-| `widgets.h` | Light/dark colours and the custom-painted parts: laptop drawing, side tiles, popover, switch |
+| `mainwindow.cpp/.h` | Window, tray, action mapping (media keys, open an app, shortcut, command), calibration, settings in `%APPDATA%\cronos\cronos.ini` |
+| `widgets.h` | Light/dark colours, fonts and the custom-painted parts: laptop drawing, side tiles, settings card, popover, switch. `Glide` is the one animation helper they share |
+| `main.cpp` | Starts the window, or with `--hidden` only the tray icon. Exits if a copy is already running, after asking that copy to show its window |
+| `install.ps1` | Release build, copied with its Qt files to `%LOCALAPPDATA%\Programs\Cronos`, Start menu shortcut, started at sign-in (the `Run` registry value "Cronos") |
+| `cronos.rc`, `docs/images/cronos.ico` | The exe's icon. `ui_test docs/images` writes the `.ico` again from the drawing in `mainwindow.cpp` |
 | `ui_test.cpp` | Popover open/close behaviour, driven without showing the window (`ctest`). `ui_test <folder>` also saves pictures of the window (the README images in `docs/images`). |
 | `tuning/` | Recorder, replay and sweep tools for tuning the detector against recorded taps |
 
 Left/right: the laptop's mic array has two channels. Each tap's first 5 ms are cross-correlated between them
 (band-passed to 2-6 kHz); the lag (in samples, printed per tap in the activity log) says which mic heard it
 first. Measured on real taps on this laptop: left taps lag +2.1..+2.9 samples, right taps -2.3..-1.8, so the
-default dividing line of 0 works without calibrating. "Calibrate..." (five taps per side) is there for other
-laptops. Comparing above 4 kHz was tried first and failed on soft taps: they are dominated by a ~15 kHz ring,
+default dividing line of 0 works without calibrating. "Calibrate..." (five taps per side) moves that line on
+other laptops, and switches on the checks against other sounds (below). Comparing above 4 kHz was tried first and failed on soft taps: they are dominated by a ~15 kHz ring,
 and matching on that slips by whole cycles. See `tuning/sweep.cpp` for how the band was chosen.
 
 Not built: tap intensity classes, ML classifier, tap-and-hold (a held finger makes no sound).
@@ -32,7 +35,19 @@ that recording are recognised at onset ratios 3-5 (default 4), with no false tri
 
 Typing and mouse clicks are rejected by ignoring taps within 300 ms after any keyboard/mouse input, and by
 discarding a pending pattern if input arrives before it closes (a keystroke is heard before Windows reports it).
-Other sharp noises (clap, cup on the desk) still count as taps; single tap is unmapped by default for that reason.
+
+Other sounds are rejected by four checks, the last three switched on by "Calibrate...". A sound louder for
+more than 30 ms is not a tap (`maxTapMs`; taps last 5-25 ms, spoken consonants that passed at 40 lasted 38-42).
+A sound whose lag matches neither palm rest did not come from one (`sideLag`, `sideTolerance`). A tap shakes the
+chassis, so its click comes with a thump at 80-300 Hz within 20 ms, while a click without one (a slap on a
+shoulder, a clap) came through the air (`minThumpDb`); whether a sound counts is therefore decided 20 ms after it
+began. And a tap makes the chassis ring, so its zero-crossing frequency above 4 kHz is 13-16 kHz, while speech
+and cracked knuckles mostly measure 3-9 kHz (`minRingHz`, 12500). Speech gets past the thump check because the
+voice itself has energy at 80-300 Hz. Measured on the four recordings in `tuning/` at the default sensitivity:
+all 79 taps kept with the right count, actions fired by other sounds 49 with no checks, 12 before the ring check,
+3 with it. What still passes is a quiet sound from a palm rest's direction (a hand brushing it), because the
+room's rumble hides whether it had a thump and a touch on the chassis rings it. Single tap is still unmapped by
+default.
 
 ## Core Concept
 - Continuously capture audio from the built-in microphone.

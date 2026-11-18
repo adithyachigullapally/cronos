@@ -92,7 +92,7 @@ int main(int argc, char **argv)
                              {"first25"}, {"first50"}, {"ild4k_3"}, {"ild4k_20"}, {"ild1k_20"}, {"ildbb_20"}, {"ildbb_60"}};
     std::vector<long> onsets;
     for (size_t k = 0; k < ends.size(); ++k) {
-        const long rough = ends[k] - long(durs[k] * 48) - 240;
+        const long rough = ends[k] - long(std::max(durs[k], 20.f) * 48) - 240; // a tap is reported 20 ms after it began, or when it ends if later
         if (rough < 480 || rough + 4800 > long(l.size()))
             continue;
         const long on = firstAbove(avg, rough, 480 + long(durs[k] * 48), 0.2f);
